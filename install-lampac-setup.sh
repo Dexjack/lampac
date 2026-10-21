@@ -1,522 +1,609 @@
 #!/usr/bin/env bash
-# Lampac NextGen setup command (managed by installer)
-# Standalone installer and manager. This file does not load or download install.sh.
+#
+# Lampac NextGen setup manager — a thin, safe wrapper around the official
+# upstream installer (install.sh published in the lampac-nextgen/lampac repo).
+#
+# Architecture constraints of this wrapper (intentional, reviewer-approved):
+#   * This script implements NO lifecycle logic of its own: no release archive
+#     download/extraction, no rsync, no ownership changes, no backup snapshots,
+#     no independent removal. Core.dll is never renamed or rewritten.
+#   * update / rollback / remove download the CURRENT official install.sh into
+#     a temporary file and invoke it with its documented arguments:
+#       update    ->  --update
+#       rollback  ->  --update --tag <selected valid tag>
+#       remove    ->  --remove
+#   * Installation parameters are derived from the selected actual systemd unit
+#     and passed to the official installer as LAMPAC_INSTALL_ROOT,
+#     LAMPAC_USER and LAMPAC_SERVICE_NAME.
+#   * The service is selected with LAMPAC_SERVICE_NAME=<unit>. "lampac" is only
+#     the default; any non-default unit installed by the official installer is
+#     supported the same way (see usage below).
+#   * `lampac setup` is an optional interactive menu that is a thin UI on top
+#     of the same wrapper actions.
+#
 set -uo pipefail
 
-readonly SERVICE_NAME='lampac.service'
-readonly COMMAND_PATH='/usr/local/bin/lampac'
-readonly UPSTREAM_REPOSITORY='lampac-nextgen/lampac'
-readonly APP_ARCHIVE='lampac-nextgen.zip'
-readonly SETUP_VERSION='1.1.0'
-SELECTED_TAG=''
-UPDATE_STAGE=''
-UPDATE_STOPPED=0
-UPDATE_SNAPSHOT=''
-UPDATE_SNAPSHOT_COMPLETE=0
-BACKUP_ARCHIVE=''
-BACKUP_COMPLETE=0
-BACKUP_STOPPED=0
-BACKUP_LIST_FILE=''
+readonly WRAPPER_VERSION='2.0.0'
+readonly WRAPPER_MARKER='# lampac-setup-manager wrapper'
+readonly LEGACY_MARKER='# Lampac NextGen setup command (managed by installer)'
+readonly COMMAND_PATH="${LAMPAC_SETUP_COMMAND_PATH:-/usr/local/bin/lampac}"
+readonly DEFAULT_SERVICE='lampac'
+readonly DEFAULT_REPO='lampac-nextgen/lampac'
+readonly SERVICE_NAME_PATTERN='^[A-Za-z0-9][A-Za-z0-9_.@:-]{0,127}$'
+readonly TAG_PATTERN='^v?[0-9]+([._+-][0-9A-Za-z.-]+){0,10}$'
+readonly RELEASES_PER_PAGE=100
+readonly MAX_MENU_CHOICES=15
+readonly MAX_INPUT_LENGTH=256
 
-error() { printf 'Ошибка: %s\n' "$*" >&2; }
+STATE_SERVICE=''
+STATE_UNIT=''
+STATE_ROOT=''
+STATE_USER=''
+STATE_INSTALLER=''
+
+error() { printf 'Error: %s\n' "$*" >&2; }
 info() { printf '  %s\n' "$*"; }
 
-service_root() {
-  local root fragment description exec_start
-  root="$(systemctl show "$SERVICE_NAME" -p WorkingDirectory --value 2>/dev/null)" || return 1
-  fragment="$(systemctl show "$SERVICE_NAME" -p FragmentPath --value 2>/dev/null)" || return 1
-  description="$(systemctl show "$SERVICE_NAME" -p Description --value 2>/dev/null)" || return 1
-  exec_start="$(systemctl show "$SERVICE_NAME" -p ExecStart --value 2>/dev/null)" || return 1
-  [[ "$fragment" == "/etc/systemd/system/$SERVICE_NAME" && -f "$fragment" && ! -L "$fragment" ]] || return 1
-  [[ "$description" == 'Lampac NextGen' ]] || return 1
-  [[ "$root" == /* && "$root" != / && -d "$root" && -f "$root/Core.dll" ]] || return 1
-  [[ "$root" == /opt/* || "$root" == /*/*/* ]] || return 1
-  [[ "$(readlink -f -- "$root" 2>/dev/null)" == "$root" ]] || return 1
-  [[ "$exec_start" == *" $root/Core.dll"* ]] || return 1
-  case "$root" in /bin|/boot|/dev|/etc|/home|/lib|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var) return 1 ;; esac
-  printf '%s\n' "$root"
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
 }
 
-require_tools() {
-  local tool missing=0
-  for tool in "$@"; do
-    if ! command -v "$tool" >/dev/null 2>&1; then error "Не найдена зависимость $tool."; missing=1; fi
-  done
-  (( missing == 0 ))
+usage() {
+  cat <<USAGE_EOF
+Lampac NextGen setup manager v$WRAPPER_VERSION — thin wrapper around the official installer.
+
+This command implements no install/update/rollback/remove logic itself. It downloads the
+current official install.sh into a temporary file and invokes it with documented arguments,
+passing installation parameters derived from the selected systemd unit
+(LAMPAC_INSTALL_ROOT, LAMPAC_USER, LAMPAC_SERVICE_NAME).
+
+Usage:
+  bash install-lampac-setup.sh        Install this command as $COMMAND_PATH
+  lampac setup                        Interactive menu (thin UI)
+  lampac update [--tag VER] [--dry-run] [--force] [--pre-release] [-v]
+                                      Official installer: --update [same flags]
+  lampac rollback [--tag VER]         Official installer: --update --tag VER
+                                      Without --tag, published releases are listed
+                                      for interactive selection (valid tags only).
+  lampac remove                       Official installer: --remove
+  lampac start|stop|restart           Manage the selected systemd unit
+  lampac status                       Show the selected unit status
+  lampac log                          Show the last 50 log lines of the unit
+
+Selecting a non-default service (any unit installed by the official installer with a
+custom service name is supported; "lampac" is only the default):
+
+  LAMPAC_SERVICE_NAME=lampac-nextgen lampac setup
+  LAMPAC_SERVICE_NAME=lampac-nextgen lampac update
+  LAMPAC_SERVICE_NAME=lampac-nextgen lampac remove
+
+Optional environment:
+  LAMPAC_SERVICE_NAME   systemd unit name (with or without the .service suffix)
+  LAMPAC_GITHUB_REPO    owner/repo used for the official installer and releases
+                        (default: $DEFAULT_REPO)
+
+All lifecycle operations require explicit confirmation. The official installer is then
+invoked verbatim and may ask for its own confirmations and root privileges.
+USAGE_EOF
 }
+
+# ─── Service selection and unit derivation ───────────────────────────────────
+# Resolves the selected systemd unit and derives LAMPAC_INSTALL_ROOT (the unit
+# WorkingDirectory) and LAMPAC_USER (the unit User). The unit must be a native
+# unit written by the official installer and must run Core.dll from its install
+# root, which keeps the wrapper from managing unrelated services.
+
+resolve_context() {
+  local name="${LAMPAC_SERVICE_NAME:-$DEFAULT_SERVICE}"
+  local loadstate fragment workdir user exec_start
+
+  [[ "$name" =~ $SERVICE_NAME_PATTERN ]] \
+    || { error "Invalid LAMPAC_SERVICE_NAME '$name'."; return 1; }
+  name="${name%.service}"
+  STATE_SERVICE="$name"
+  STATE_UNIT="$name.service"
+
+  loadstate="$(systemctl show "$STATE_UNIT" -p LoadState --value 2>/dev/null)"
+  if [[ "$loadstate" != 'loaded' ]]; then
+    error "systemd unit $STATE_UNIT is not loaded on this host (LAMPAC_SERVICE_NAME selects the unit)."
+    return 1
+  fi
+
+  fragment="$(systemctl show "$STATE_UNIT" -p FragmentPath --value 2>/dev/null)"
+  if [[ "$fragment" != "/etc/systemd/system/$STATE_UNIT" || ! -f "$fragment" || -L "$fragment" ]]; then
+    error "Unit $STATE_UNIT is not a native unit at /etc/systemd/system/$STATE_UNIT; refusing to manage it."
+    return 1
+  fi
+
+  workdir="$(systemctl show "$STATE_UNIT" -p WorkingDirectory --value 2>/dev/null)"
+  user="$(systemctl show "$STATE_UNIT" -p User --value 2>/dev/null)"
+  exec_start="$(systemctl show "$STATE_UNIT" -p ExecStart --value 2>/dev/null)"
+  [[ -n "$workdir" && -n "$user" ]] \
+    || { error "Unit $STATE_UNIT does not declare WorkingDirectory/User; cannot derive installation parameters."; return 1; }
+
+  [[ "$workdir" == /* && "$workdir" != '/' && -d "$workdir" ]] \
+    || { error "Unit $STATE_UNIT declares an unusable WorkingDirectory '$workdir'."; return 1; }
+  case "$workdir" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/libx32|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var)
+      error "Refusing to manage a unit rooted at top-level directory $workdir."
+      return 1 ;;
+  esac
+  [[ "$workdir" == /opt/* || "$workdir" == /*/*/* ]] \
+    || { error "Install root '$workdir' is not a nested directory; refusing."; return 1; }
+  [[ "$(readlink -f -- "$workdir" 2>/dev/null)" == "$workdir" ]] \
+    || { error "Install root '$workdir' is a symlink; refusing."; return 1; }
+  [[ "$exec_start" == *" $workdir/Core.dll"* ]] \
+    || { error "Unit $STATE_UNIT does not run Core.dll from $workdir — it does not look like a Lampac NextGen installation created by the official installer; refusing."; return 1; }
+
+  STATE_ROOT="$workdir"
+  STATE_USER="$user"
+  return 0
+}
+
+require_core_in_root() {
+  [[ -f "$STATE_ROOT/Core.dll" ]] \
+    || { error "Install root $STATE_ROOT does not contain Core.dll; refusing to proceed."; return 1; }
+}
+
+# ─── Official installer delegation ───────────────────────────────────────────
+
+cleanup() {
+  if [[ -n "$STATE_INSTALLER" && -f "$STATE_INSTALLER" ]]; then
+    rm -f -- "$STATE_INSTALLER"
+  fi
+  STATE_INSTALLER=''
+  return 0
+}
+trap cleanup EXIT
+
+fetch_upstream_installer() {
+  local repo="${LAMPAC_GITHUB_REPO:-$DEFAULT_REPO}"
+  local url first_line
+
+  [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+    || { error "Invalid LAMPAC_GITHUB_REPO '$repo'."; return 1; }
+  command -v curl >/dev/null 2>&1 || { error 'curl is required to download the official installer.'; return 1; }
+
+  STATE_INSTALLER="$(mktemp "${TMPDIR:-/tmp}/lampac-official-install.sh.XXXXXX")" \
+    || { error 'Failed to create a temporary file for the official installer.'; return 1; }
+
+  url="https://raw.githubusercontent.com/${repo}/main/install.sh"
+  info "Downloading the current official installer: $url"
+  if ! curl -fsSL --retry 2 -o "$STATE_INSTALLER" "$url"; then
+    error "Failed to download the official install.sh from ${repo}."
+    return 1
+  fi
+  [[ -s "$STATE_INSTALLER" ]] || { error 'The downloaded install.sh is empty.'; return 1; }
+
+  first_line="$(head -n 1 -- "$STATE_INSTALLER" 2>/dev/null)"
+  if [[ "$first_line" != '#!'* ]]; then
+    error 'The downloaded file does not look like a shell script.'
+    return 1
+  fi
+  if ! grep -q -- '--update' "$STATE_INSTALLER" || ! grep -q -- '--remove' "$STATE_INSTALLER"; then
+    error 'The downloaded file does not look like the official Lampac install.sh.'
+    return 1
+  fi
+  return 0
+}
+
+# run_upstream_installer ARGS... — downloads install.sh once and runs it with
+# exactly the given documented arguments plus derived LAMPAC_* environment.
+run_upstream_installer() {
+  local rc=0
+  fetch_upstream_installer || return 1
+
+  export LAMPAC_INSTALL_ROOT="$STATE_ROOT"
+  export LAMPAC_USER="$STATE_USER"
+  export LAMPAC_SERVICE_NAME="$STATE_SERVICE"
+
+  info "Invocation: bash <downloaded install.sh> $*"
+  info "Installer environment: LAMPAC_SERVICE_NAME=$STATE_SERVICE LAMPAC_INSTALL_ROOT=$STATE_ROOT LAMPAC_USER=$STATE_USER"
+  bash "$STATE_INSTALLER" "$@" || rc=$?
+  return "$rc"
+}
+
+# ─── Confirmation (destructive operations) ───────────────────────────────────
 
 confirm_token() {
-  local token="$1" prompt="$2" answer
-  [[ -r /dev/tty ]] || { error 'Для подтверждения требуется интерактивный терминал; действие отменено.'; return 1; }
-  printf '  %s Введите %s для подтверждения (иначе отмена): ' "$prompt" "$token"
-  IFS= read -r answer </dev/tty || { printf '\n'; return 1; }
-  [[ "$answer" == "$token" ]]
+  local token="$1"
+  shift
+  printf '\n  %s\n' "$*"
+  printf '  Type %s to confirm (anything else aborts): ' "$token"
+  local answer
+  if ! IFS= read -r answer; then
+    printf '\n'
+    error 'No confirmation received; operation aborted.'
+    return 1
+  fi
+  [[ "${#answer}" -le "$MAX_INPUT_LENGTH" ]] \
+    || { error 'Confirmation input is too long; operation aborted.'; return 1; }
+  [[ "$answer" == "$token" ]] \
+    || { error 'Confirmation does not match; operation cancelled.'; return 1; }
+  return 0
 }
 
-run_admin() {
+run_privileged() {
   if (( EUID == 0 )); then
-    "$COMMAND_PATH" setup "$@"
+    "$@"
   elif command -v sudo >/dev/null 2>&1; then
-    sudo "$COMMAND_PATH" setup "$@"
+    sudo "$@"
   else
-    error 'Для этого действия нужны права администратора (sudo не найден).'
+    error "Administrator privileges are required for: $*"
     return 1
   fi
 }
 
-release_version_is_current() {
-  local latest="${1#v}" installed="${2#v}"
-  latest="${latest#"${latest%%[![:space:]]*}"}"
-  latest="${latest%"${latest##*[![:space:]]}"}"
-  installed="${installed#"${installed%%[![:space:]]*}"}"
-  installed="${installed%"${installed##*[![:space:]]}"}"
-  [[ -n "$installed" && "$installed" != N/A && "$latest" == "$installed" ]]
+# ─── Release tags (rollback selection) ───────────────────────────────────────
+
+validate_release_tag() {
+  [[ -n "$1" && "${#1}" -le 64 && "$1" =~ $TAG_PATTERN ]] \
+    || { error "Invalid release tag '$1'."; return 1; }
+  return 0
 }
 
-latest_release_tag() {
-  local json tag
-  json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases/latest")" \
-    || { error 'Не удалось получить последний релиз GitHub.'; return 1; }
-  tag="$(printf '%s' "$json" | jq -er '.tag_name | select(type == "string")')" || return 1
-  [[ "$tag" =~ ^v?[0-9]+([._+-][A-Za-z0-9.-]+|\.[0-9]+)*$ ]] || { error 'GitHub вернул некорректный тег релиза.'; return 1; }
-  printf '%s\n' "$tag"
+list_published_tags() {
+  local repo="${LAMPAC_GITHUB_REPO:-$DEFAULT_REPO}"
+  local json
+  [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] \
+    || { error "Invalid LAMPAC_GITHUB_REPO '$repo'."; return 1; }
+  command -v curl >/dev/null 2>&1 || { error 'curl is required to list published releases.'; return 1; }
+  command -v jq >/dev/null 2>&1 || { error 'jq is required to list published releases; install it or pass --tag explicitly.'; return 1; }
+  json="$(curl -fsSL -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${repo}/releases?per_page=${RELEASES_PER_PAGE}" 2>/dev/null)" \
+    || { error "Failed to fetch the release list from GitHub (repo ${repo})."; return 1; }
+  printf '%s' "$json" | jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name' 2>/dev/null
 }
 
-version_tag_is_older() {
-  local candidate="${1#v}" current="${2#v}" first
-  [[ "$candidate" != "$current" ]] || return 1
-  first="$(printf '%s\n%s\n' "$candidate" "$current" | sort -V | head -n1)"
+read_installed_version() {
+  local v
+  [[ -r "$STATE_ROOT/version.txt" ]] || return 1
+  v="$(head -n 1 -- "$STATE_ROOT/version.txt" 2>/dev/null)"
+  v="$(trim "$v")"
+  [[ "$v" =~ $TAG_PATTERN ]] || return 1
+  printf '%s' "$v"
+}
+
+version_is_older() {
+  local candidate="${1#v}" reference="${2#v}" first
+  [[ "$candidate" != "$reference" ]] || return 1
+  first="$(printf '%s\n%s\n' "$candidate" "$reference" | sort -V 2>/dev/null | sed -n '1p')"
   [[ "$first" == "$candidate" ]]
 }
 
-show_progress() {
-  local completed="$1" phase="$2" status="$3" width=24 filled percent i
-  filled=$(( completed * width / 4 )); percent=$(( completed * 25 ))
-  printf '\n  Прогресс: ['
-  for ((i = 0; i < width; i++)); do
-    if (( i < filled )); then printf '#'; else printf '-'; fi
+tag_in_list() {
+  local needle="$1" normalized t
+  normalized="${needle#v}"
+  shift
+  for t in "$@"; do
+    [[ "${t#v}" == "$normalized" ]] && return 0
   done
-  printf '] %3d%%\n  Этап:   %s\n  Сейчас: %s\n\n' "$percent" "$phase" "$status"
+  return 1
 }
 
-setup_cleanup() {
-  if (( UPDATE_STOPPED || BACKUP_STOPPED )); then systemctl start "$SERVICE_NAME" >/dev/null 2>&1 || true; UPDATE_STOPPED=0; BACKUP_STOPPED=0; fi
-  if [[ -n "$UPDATE_STAGE" ]]; then rm -rf -- "$UPDATE_STAGE"; UPDATE_STAGE=''; fi
-  if (( ! UPDATE_SNAPSHOT_COMPLETE )) && [[ -n "$UPDATE_SNAPSHOT" ]]; then rm -f -- "$UPDATE_SNAPSHOT"; UPDATE_SNAPSHOT=''; fi
-  if (( ! BACKUP_COMPLETE )) && [[ -n "$BACKUP_ARCHIVE" ]]; then rm -f -- "$BACKUP_ARCHIVE"; BACKUP_ARCHIVE=''; fi
-  if [[ -n "$BACKUP_LIST_FILE" ]]; then rm -f -- "$BACKUP_LIST_FILE"; BACKUP_LIST_FILE=''; fi
-}
+select_tag_interactively() {
+  local current tag answer
+  local -a tags=() choices=()
+  mapfile -t tags < <(list_published_tags)
+  (( ${#tags[@]} > 0 )) || { error 'No published releases found.'; return 1; }
 
-create_installation_snapshot() {
-  local root="$1" purpose="$2" backup_dir timestamp
-  backup_dir='/var/backups/lampac-nextgen'
-  install -d -o root -g root -m 700 "$backup_dir" || { error 'Не удалось создать защищённый каталог резервных копий.'; return 1; }
-  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  UPDATE_SNAPSHOT="$(mktemp --suffix=.tar.gz "$backup_dir/lampac-${purpose}-${timestamp}.XXXXXX")" || return 1
-  if ! tar --xattrs -czf "$UPDATE_SNAPSHOT" -C "$root" . || [[ ! -s "$UPDATE_SNAPSHOT" ]]; then
-    rm -f -- "$UPDATE_SNAPSHOT"
-    UPDATE_SNAPSHOT=''
-    error 'Не удалось создать полный снимок установки; операция не начата.'
-    return 1
-  fi
-  chmod 600 "$UPDATE_SNAPSHOT" || { rm -f -- "$UPDATE_SNAPSHOT"; UPDATE_SNAPSHOT=''; return 1; }
-  UPDATE_SNAPSHOT_COMPLETE=1
-  info "Создан снимок для восстановления: $UPDATE_SNAPSHOT"
-}
-
-restore_installation_snapshot() {
-  local root="$1" snapshot="$2"
-  [[ -n "$snapshot" && -s "$snapshot" ]] || return 1
-  mkdir -p -- "$root" || return 1
-  find "$root" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + || return 1
-  tar --xattrs -xzf "$snapshot" -C "$root"
-}
-
-restore_after_update_failure() {
-  local root="$1" snapshot="$2"
-  error 'Обновление не завершилось; восстанавливаю предыдущую установку.'
-  if restore_installation_snapshot "$root" "$snapshot"; then
-    if systemctl start "$SERVICE_NAME"; then
-      UPDATE_STOPPED=0
-      error 'Предыдущая версия восстановлена и служба запущена.'
-    else
-      error 'Предыдущая версия восстановлена, но службу не удалось запустить автоматически.'
+  current="$(read_installed_version || true)"
+  if [[ -n "$current" ]]; then
+    for tag in "${tags[@]}"; do
+      version_is_older "$tag" "$current" && choices+=("$tag")
+    done
+    if (( ${#choices[@]} == 0 )); then
+      error "Installed version $current is not newer than any published release; nothing to roll back to."
+      return 1
     fi
   else
-    error "Автоматическое восстановление не удалось. Снимок сохранён: $snapshot"
-  fi
-}
-
-abort_update() {
-  local root="$1" snapshot="$2"
-  trap '' HUP INT TERM
-  if [[ -n "$snapshot" && -s "$snapshot" ]]; then restore_after_update_failure "$root" "$snapshot"; fi
-  setup_cleanup
-  exit 143
-}
-
-abort_remove() {
-  local root="$1" snapshot="$2" unit_backup="$3" was_enabled="$4" was_active="$5"
-  trap '' HUP INT TERM
-  error 'Удаление прервано; восстанавливаю установку и службу.'
-  if restore_installation_snapshot "$root" "$snapshot" && restore_service_unit "$unit_backup" "$was_enabled" "$was_active"; then
-    rm -f -- "$unit_backup"
-    error 'Установка и unit-файл восстановлены.'
-  else
-    error "Автоматическое восстановление не удалось. Снимки сохранены: $snapshot и $unit_backup"
-  fi
-  exit 143
-}
-
-update_release() {
-  local tag="$1" root current user group stage archive snapshot mode
-  local -a excludes=()
-  [[ "$tag" =~ ^v?[0-9]+([._+-][A-Za-z0-9.-]+|\.[0-9]+)*$ ]] || { error 'Некорректный тег релиза.'; return 1; }
-  root="$(service_root)" || { error 'Не удалось определить безопасный каталог Lampac.'; return 1; }
-  current='N/A'; [[ ! -r "$root/version.txt" ]] || current="$(<"$root/version.txt")"
-  if release_version_is_current "$tag" "$current"; then
-    info "Lampac NextGen уже обновлён до версии ${tag#v}; обновление не требуется."
-    return 0
-  fi
-  require_tools curl jq unzip rsync tar find install date mktemp || return 1
-  user="$(systemctl show "$SERVICE_NAME" -p User --value 2>/dev/null)"
-  group="$(systemctl show "$SERVICE_NAME" -p Group --value 2>/dev/null)"
-  [[ -n "$user" ]] || user=lampac
-  [[ -n "$group" ]] || group="$user"
-  getent passwd "$user" >/dev/null && getent group "$group" >/dev/null \
-    || { error 'Не удалось определить учётную запись службы; обновление не начато.'; return 1; }
-
-  stage="$(mktemp -d /tmp/lampac-setup-update.XXXXXX)" || return 1
-  UPDATE_STAGE="$stage"
-  UPDATE_STOPPED=0
-  UPDATE_SNAPSHOT=''
-  UPDATE_SNAPSHOT_COMPLETE=0
-  trap setup_cleanup EXIT
-  archive="$stage/$APP_ARCHIVE"
-  show_progress 1 'Загрузка релиза' "Загружаю $tag из ${UPSTREAM_REPOSITORY}."
-  curl -fSL --retry 3 -o "$archive" "https://github.com/${UPSTREAM_REPOSITORY}/releases/download/${tag}/${APP_ARCHIVE}" \
-    || { error 'Загрузка релиза не удалась.'; return 1; }
-  [[ -s "$archive" ]] || { error 'Архив релиза пуст.'; return 1; }
-  show_progress 2 'Подготовка файлов' 'Проверяю архив и распаковываю во временный каталог.'
-  unzip -tq "$archive" >/dev/null || { error 'Архив релиза повреждён.'; return 1; }
-  mkdir "$stage/app" && unzip -oq "$archive" -d "$stage/app" || return 1
-  local -a dirs=()
-  mapfile -t dirs < <(find "$stage/app" -mindepth 1 -maxdepth 1 -type d)
-  if (( ${#dirs[@]} == 1 )) && [[ ! -f "$stage/app/Core.dll" ]]; then
-    shopt -s dotglob nullglob
-    mv "${dirs[0]}"/* "$stage/app/"
-    shopt -u dotglob nullglob
-    rmdir "${dirs[0]}" 2>/dev/null || true
-  fi
-  [[ -f "$stage/app/Core.dll" ]] || { error 'В архиве отсутствует Core.dll.'; return 1; }
-  excludes=(--exclude=install.sh --exclude=init.conf --exclude=init.yaml --exclude='init.conf.backup.*' --exclude=mods/ --exclude=data/kinoukr.json --exclude=data/PizdatoeDb.json --exclude='*.db' --exclude='*.db-shm' --exclude='*.db-wal' --exclude=logs/ --exclude=cache/ --exclude=TorrServer --exclude=torrserver/ --exclude=data/ts/ --exclude=.local/ --exclude=.aspnet/ --exclude=.claude/ --exclude=.config/ --exclude=users.json --exclude=passwd --exclude=current.conf --exclude=database/ --exclude=wwwroot/ --exclude=plugins/override/ --exclude=notifications_date.txt --exclude=module/NextHUB/override/ --exclude=module/Catalog/override/ --exclude=excludes.conf --exclude=version.txt)
-  if [[ -f "$root/excludes.conf" ]]; then
-    mode="$(stat -c '%a' "$root/excludes.conf" 2>/dev/null)"
-    [[ "$(stat -c '%U:%G' "$root/excludes.conf" 2>/dev/null)" == root:root && "$mode" =~ ^[0-7]{3,4}$ ]] \
-      && (( (8#$mode & 0022) == 0 )) \
-      || { error 'excludes.conf должен принадлежать root:root и быть недоступен для записи группе и остальным.'; return 1; }
-    while IFS= read -r name || [[ -n "$name" ]]; do
-      name="${name%$'\r'}"
-      [[ -z "$name" || "$name" == \#* ]] || excludes+=(--exclude="$name")
-    done < "$root/excludes.conf"
+    info "Installed version unknown ($STATE_ROOT/version.txt missing or unparsable); listing all published releases."
+    choices=("${tags[@]}")
   fi
 
-  show_progress 3 'Обновление приложения' "Останавливаю $SERVICE_NAME и обновляю $root."
-  systemctl stop "$SERVICE_NAME" || { error 'Не удалось остановить службу; файлы не изменены.'; return 1; }
-  UPDATE_STOPPED=1
-  create_installation_snapshot "$root" update || return 1
-  snapshot="$UPDATE_SNAPSHOT"
-  trap 'abort_update "$root" "$snapshot"' HUP INT TERM
-  if ! rsync -a --delete "${excludes[@]}" "$stage/app/" "$root/"; then
-    restore_after_update_failure "$root" "$snapshot"
-    trap - HUP INT TERM
-    return 1
+  if (( ${#choices[@]} > MAX_MENU_CHOICES )); then
+    choices=("${choices[@]:0:MAX_MENU_CHOICES}")
   fi
-  if ! printf '%s\n' "${tag#v}" > "$root/version.txt" || ! chown -R "$user:$group" "$root"; then
-    restore_after_update_failure "$root" "$snapshot"
-    trap - HUP INT TERM
-    return 1
-  fi
-  show_progress 4 'Запуск службы' "Запускаю $SERVICE_NAME с версией $tag."
-  if ! systemctl start "$SERVICE_NAME"; then
-    restore_after_update_failure "$root" "$snapshot"
-    trap - HUP INT TERM
-    return 1
-  fi
-  UPDATE_STOPPED=0
-  trap - HUP INT TERM
-  trap - EXIT
-  setup_cleanup
-  info "Готово: Lampac NextGen $tag обновлён. Снимок для ручного отката: $snapshot"
-}
 
-backup_user_data() {
-  local root backup_dir timestamp item path was_active=0
-  local -a data_paths=(init.conf init.yaml users.json passwd current.conf excludes.conf notifications_date.txt 'init.conf.backup.*' mods data database wwwroot plugins/override module/NextHUB/override module/Catalog/override .local .aspnet .config)
-  require_tools tar mktemp install date || return 1
-  root="$(service_root)" || { error 'Не удалось определить безопасный каталог Lampac.'; return 1; }
-  backup_dir='/var/backups/lampac-nextgen'
-  printf '\n  Будут сохранены конфигурация, аккаунты и постоянные данные из %s.\n' "$root"
-  printf '  Архив будет содержать секреты (например passwd) и доступен только root: %s\n' "$backup_dir"
-  if [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" == active ]]; then
-    was_active=1
-    printf '  Для согласованной копии служба будет временно остановлена и затем запущена снова.\n'
-  fi
-  confirm_token BACKUP 'Введите BACKUP' || { info 'Резервное копирование отменено.'; return 1; }
-  install -d -o root -g root -m 700 "$backup_dir" || { error 'Не удалось создать защищённый каталог резервных копий.'; return 1; }
-  BACKUP_LIST_FILE="$(mktemp /tmp/lampac-setup-backup-list.XXXXXX)" || return 1
-  trap setup_cleanup EXIT
-  BACKUP_COMPLETE=0
-  BACKUP_STOPPED=0
-  for item in "${data_paths[@]}"; do
-    if [[ "$item" == init.conf.backup.* ]]; then
-      for path in "$root"/init.conf.backup.*; do [[ -e "$path" ]] && printf '%s\0' "${path#"$root"/}" >> "$BACKUP_LIST_FILE"; done
-    elif [[ -e "$root/$item" || -L "$root/$item" ]]; then
-      printf '%s\0' "$item" >> "$BACKUP_LIST_FILE"
-    fi
+  printf '\n  Select the release to roll back to (valid published tags):\n\n'
+  local i
+  for ((i = 0; i < ${#choices[@]}; i++)); do
+    printf '    %d) %s\n' "$((i + 1))" "${choices[$i]}"
   done
-  local -a root_databases=("$root"/*.db "$root"/*.db-shm "$root"/*.db-wal)
-  for path in "${root_databases[@]}"; do [[ -f "$path" ]] && printf '%s\0' "${path#"$root"/}" >> "$BACKUP_LIST_FILE"; done
-  if [[ ! -s "$BACKUP_LIST_FILE" ]]; then setup_cleanup; trap - EXIT; error 'Пользовательские данные для резервного копирования не найдены.'; return 1; fi
-  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-  BACKUP_ARCHIVE="$(mktemp --suffix=.tar.gz "$backup_dir/lampac-data-${timestamp}.XXXXXX")" || { setup_cleanup; trap - EXIT; return 1; }
-  if (( was_active )); then
-    BACKUP_STOPPED=1
-    if ! systemctl stop "$SERVICE_NAME"; then
-      setup_cleanup
-      trap - EXIT
-      error 'Не удалось остановить службу; резервная копия не создана.'
+  printf '    0) Cancel\n\n  Version number: '
+  while true; do
+    if ! IFS= read -r answer; then
+      printf '\n'
+      error 'No selection made; rollback cancelled.'
+      return 1
+    fi
+    case "$answer" in
+      0) info 'Rollback cancelled.'; return 1 ;;
+      ''|*[!0-9]*) error 'Enter a version number from the list, or 0 to cancel.' ;;
+      *)
+        (( ${#answer} <= 3 )) || { error 'Input too long.'; continue; }
+        (( 10#$answer >= 1 && 10#$answer <= ${#choices[@]} )) || { error 'There is no such entry.'; continue; }
+        SELECTED_TAG="${choices[$((10#$answer - 1))]}"
+        return 0 ;;
+    esac
+    printf '  Version number: '
+  done
+}
+
+# ─── Wrapper commands ─────────────────────────────────────────────────────────
+
+cmd_update() {
+  local -a pass=()
+  while (( $# )); do
+    case "$1" in
+      --tag)
+        if [[ $# -lt 2 || -z "${2:-}" || "${2:0:1}" == '-' ]]; then
+          error '--tag requires a version argument (e.g. --tag v1.2.3).'
+          return 2
+        fi
+        validate_release_tag "$2" || return 2
+        pass+=(--tag "$2")
+        shift 2 ;;
+      --dry-run|--force|--pre-release|-v|--verbose)
+        pass+=("$1")
+        shift ;;
+      *)
+        error "Unknown option for update: $1"
+        return 2 ;;
+    esac
+  done
+
+  resolve_context || return 1
+  require_core_in_root || return 1
+
+  printf '\n  Update via the official installer:\n'
+  info "Service:      $STATE_UNIT"
+  info "Install root: $STATE_ROOT"
+  info "Arguments:    --update${pass[*]:+ ${pass[*]}}"
+  confirm_token UPDATE \
+    "Update Lampac NextGen (service $STATE_UNIT) by delegating to the official installer? The installer restarts the service." \
+    || { info 'Update cancelled.'; return 1; }
+
+  run_upstream_installer --update ${pass[@]+"${pass[@]}"}
+}
+
+cmd_rollback() {
+  local tag=''
+  while (( $# )); do
+    case "$1" in
+      --tag)
+        if [[ $# -lt 2 || -z "${2:-}" || "${2:0:1}" == '-' ]]; then
+          error '--tag requires a version argument (e.g. --tag v1.2.3).'
+          return 2
+        fi
+        tag="$2"
+        shift 2 ;;
+      *)
+        error "Unknown option for rollback: $1"
+        return 2 ;;
+    esac
+  done
+
+  resolve_context || return 1
+  require_core_in_root || return 1
+
+  local -a tags=()
+  mapfile -t tags < <(list_published_tags)
+  (( ${#tags[@]} > 0 )) || { error 'No published releases found; rollback is not possible.'; return 1; }
+
+  if [[ -z "$tag" ]]; then
+    SELECTED_TAG=''
+    select_tag_interactively || return 1
+    tag="$SELECTED_TAG"
+    validate_release_tag "$tag" || return 1
+  else
+    validate_release_tag "$tag" || return 1
+    if ! tag_in_list "$tag" "${tags[@]}"; then
+      error "Tag $tag is not a published release (valid tags only are accepted)."
       return 1
     fi
   fi
-  if ! tar -czf "$BACKUP_ARCHIVE" -C "$root" --null --files-from="$BACKUP_LIST_FILE" || [[ ! -s "$BACKUP_ARCHIVE" ]]; then
-    setup_cleanup
-    trap - EXIT
-    error 'Не удалось создать архив пользовательских данных.'
-    return 1
-  fi
-  chmod 600 "$BACKUP_ARCHIVE" || { setup_cleanup; trap - EXIT; error 'Не удалось защитить архив; незавершённая копия удалена.'; return 1; }
-  BACKUP_COMPLETE=1
-  setup_cleanup
-  trap - EXIT
-  info "Резервная копия создана: $BACKUP_ARCHIVE"
-  if (( was_active )) && [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" != active ]]; then
-    error "Архив сохранён, но службу не удалось запустить автоматически: systemctl start $SERVICE_NAME"
-    return 1
-  fi
+
+  printf '\n  Rollback via the official installer:\n'
+  info "Service:      $STATE_UNIT"
+  info "Install root: $STATE_ROOT"
+  info "Arguments:    --update --tag $tag"
+  confirm_token ROLLBACK \
+    "Roll back Lampac NextGen (service $STATE_UNIT) to $tag by delegating to the official installer? The installer restarts the service." \
+    || { info 'Rollback cancelled.'; return 1; }
+
+  run_upstream_installer --update --tag "$tag"
 }
 
-select_rollback_tag() {
-  local current="$1" json tag number answer i
-  local -a tags=() choices=()
-  json="$(curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/${UPSTREAM_REPOSITORY}/releases?per_page=100")" \
-    || { error 'Не удалось получить список релизов GitHub.'; return 1; }
-  mapfile -t tags < <(printf '%s' "$json" | jq -r '.[] | select(.draft == false and .prerelease == false) | .tag_name')
-  for tag in "${tags[@]}"; do
-    [[ "$tag" =~ ^v?[0-9]+([._+-][A-Za-z0-9.-]+|\.[0-9]+)*$ ]] || continue
-    if version_tag_is_older "$tag" "$current"; then choices+=("$tag"); (( ${#choices[@]} >= 10 )) && break; fi
-  done
-  (( ${#choices[@]} > 0 )) || { error "Нет более ранних релизов; установлена версия $current."; return 1; }
-  printf '\n  ─── Выберите версию для отката ───\n\n'
-  for ((i = 0; i < ${#choices[@]}; i++)); do printf '    %d) %s\n' "$((i + 1))" "${choices[$i]}"; done
-  printf '    0) Назад\n\n'
-  while true; do
-    printf '  Номер версии: '
-    IFS= read -r answer </dev/tty || { printf '\n'; return 1; }
-    case "$answer" in
-      0) return 1 ;;
-      ''|*[!0-9]*) error 'Введите номер из списка или 0.' ;;
-      *) (( ${#answer} <= 3 )) || { error 'Слишком длинный ввод.'; continue; }
-         number=$((10#$answer)); (( number >= 1 && number <= ${#choices[@]} )) || { error 'Такого номера нет.'; continue; }
-         SELECTED_TAG="${choices[$((number - 1))]}"; return 0 ;;
-    esac
-  done
+cmd_remove() {
+  resolve_context || return 1
+
+  printf '\n  Removal via the official installer (--remove):\n'
+  info "Service:      $STATE_UNIT"
+  info "Install root: $STATE_ROOT"
+  info 'The official installer removes the systemd unit, the install directory and the service account. This wrapper runs no removal of its own; the installer may ask for its own confirmation.'
+  confirm_token REMOVE \
+    "Remove Lampac NextGen unit $STATE_UNIT and install root $STATE_ROOT by delegating to the official installer?" \
+    || { info 'Removal cancelled.'; return 1; }
+  confirm_token "$STATE_ROOT" \
+    "Second confirmation: type the full install root path ($STATE_ROOT) to proceed:" \
+    || { info 'Removal cancelled.'; return 1; }
+
+  run_upstream_installer --remove
 }
 
-restore_service_unit() {
-  local backup="$1" was_enabled="$2" was_active="$3" unit="/etc/systemd/system/$SERVICE_NAME"
-  cp -a -- "$backup" "$unit" || return 1
-  systemctl daemon-reload || return 1
-  case "$was_enabled" in
-    enabled) systemctl enable "$SERVICE_NAME" >/dev/null || return 1 ;;
-    enabled-runtime) systemctl enable --runtime "$SERVICE_NAME" >/dev/null || return 1 ;;
-  esac
-  if (( was_active )); then systemctl start "$SERVICE_NAME" || return 1; fi
-}
-
-remove_installation() {
-  local root unit="/etc/systemd/system/$SERVICE_NAME" unit_backup snapshot was_enabled was_active=0
-  root="$(service_root)" || { error 'Не удалось определить безопасный каталог Lampac.'; return 1; }
-  printf '\n  Будут остановлена служба %s и удалены каталог %s и команда %s. Учётная запись службы останется.\n' "$SERVICE_NAME" "$root" "$COMMAND_PATH"
-  confirm_token REMOVE 'Введите REMOVE' || { info 'Удаление отменено.'; return 1; }
-  confirm_token "$root" 'Введите полный путь каталога для подтверждения' || { info 'Удаление отменено.'; return 1; }
-  [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" != active ]] || was_active=1
-  was_enabled="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
-  require_tools tar find install date mktemp || return 1
-  unit_backup="$(mktemp /tmp/lampac-setup-unit.XXXXXX)" || return 1
-  if ! cp -a -- "$unit" "$unit_backup"; then rm -f -- "$unit_backup"; error 'Не удалось сохранить резервную копию unit-файла; удаление отменено.'; return 1; fi
-  UPDATE_SNAPSHOT=''
-  UPDATE_SNAPSHOT_COMPLETE=0
-  if ! create_installation_snapshot "$root" remove; then rm -f -- "$unit_backup"; return 1; fi
-  snapshot="$UPDATE_SNAPSHOT"
-  if ! systemctl stop "$SERVICE_NAME"; then rm -f -- "$unit_backup"; error 'Не удалось остановить службу; удаление отменено.'; return 1; fi
-  trap 'abort_remove "$root" "$snapshot" "$unit_backup" "$was_enabled" "$was_active"' HUP INT TERM
-  if ! systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || ! rm -f -- "$unit" || ! systemctl daemon-reload; then
-    if restore_service_unit "$unit_backup" "$was_enabled" "$was_active"; then
-      rm -f -- "$unit_backup"
-      error 'Удаление отменено: systemd не принял изменение. Unit-файл и прежнее состояние службы восстановлены.'
-    else
-      error "Удаление прервано, автоматическое восстановление не удалось. Резервная копия unit сохранена: $unit_backup"
-    fi
-    trap - HUP INT TERM
-    return 1
-  fi
-  if ! rm -rf -- "$root"; then
-    if restore_installation_snapshot "$root" "$snapshot" && restore_service_unit "$unit_backup" "$was_enabled" "$was_active"; then
-      rm -f -- "$unit_backup"
-      error 'Удаление прервано: установка и unit-файл восстановлены из снимка.'
-    else
-      error "Удаление прервано, автоматическое восстановление не удалось. Снимки сохранены: $snapshot и $unit_backup"
-    fi
-    trap - HUP INT TERM
-    return 1
-  fi
-  rm -f -- "$unit_backup"
-  trap - HUP INT TERM
-  if [[ -f "$COMMAND_PATH" ]] && grep -Fq '# Lampac NextGen setup command (managed by installer)' "$COMMAND_PATH"; then rm -f -- "$COMMAND_PATH"; fi
-  info "Lampac NextGen удалён. Снимок удалённой установки: $snapshot"
-}
-
-service_action() {
+cmd_service() {
   local action="$1"
-  if (( EUID == 0 )); then systemctl "$action" "$SERVICE_NAME"
-  elif command -v sudo >/dev/null 2>&1; then sudo systemctl "$action" "$SERVICE_NAME"
-  else error 'Для управления службой нужны права администратора (sudo).'; return 1; fi
+  resolve_context || return 1
+  run_privileged systemctl "$action" "$STATE_UNIT"
 }
 
-show_recent_logs() {
-  if (( EUID == 0 )); then journalctl -u "$SERVICE_NAME" -n 50 --no-pager
-  elif command -v sudo >/dev/null 2>&1; then sudo journalctl -u "$SERVICE_NAME" -n 50 --no-pager
-  else error 'Для чтения журнала нужны права администратора (sudo).'; return 1; fi
+cmd_status() {
+  resolve_context || return 1
+  systemctl status "$STATE_UNIT"
 }
 
-setup_action() {
-  local action="${1:-}" root current tag
-  case "$action" in
-    --update)
-      (( $# == 1 )) || { error 'Лишние параметры обновления.'; return 2; }
-      require_tools curl jq || return 1
-      tag="$(latest_release_tag)" || return 1
-      root="$(service_root)" || { error 'Не найдена подтверждённая установка Lampac.'; return 1; }
-      current='N/A'; [[ ! -r "$root/version.txt" ]] || current="$(<"$root/version.txt")"
-      if release_version_is_current "$tag" "$current"; then info "Lampac NextGen уже обновлён до версии ${tag#v}; обновление не требуется."; return 0; fi
-      confirm_token UPDATE "Обновление до $tag" || { info 'Обновление отменено.'; return 1; }
-      update_release "$tag" ;;
-    --rollback)
-      (( $# == 1 )) || { error 'Лишние параметры отката.'; return 2; }
-      require_tools curl jq || return 1
-      root="$(service_root)" || { error 'Не найдена подтверждённая установка Lampac.'; return 1; }
-      current='N/A'; [[ ! -r "$root/version.txt" ]] || current="$(<"$root/version.txt")"
-      [[ "$current" != N/A ]] || { error 'Текущая версия неизвестна; откат невозможен.'; return 1; }
-      [[ "$current" =~ ^v?[0-9]+([._+-][A-Za-z0-9.-]+|\.[0-9]+)*$ ]] \
-        || { error 'Записана некорректная текущая версия; откат остановлен.'; return 1; }
-      select_rollback_tag "$current" || return 1
-      tag="$SELECTED_TAG"
-      confirm_token ROLLBACK "Откат ${current} → ${tag}" || { info 'Откат отменён.'; return 1; }
-      update_release "$tag" ;;
-    --backup)
-      (( $# == 1 )) || { error 'Лишние параметры резервного копирования.'; return 2; }
-      backup_user_data ;;
-    --remove) (( $# == 1 )) || { error 'Лишние параметры удаления.'; return 2; }; remove_installation ;;
-    *) error 'Неизвестное действие setup.'; return 2 ;;
-  esac
+cmd_logs() {
+  resolve_context || return 1
+  run_privileged journalctl -u "$STATE_UNIT" -n 50 --no-pager
 }
+
+# ─── Interactive menu (thin UI) ───────────────────────────────────────────────
 
 setup_menu() {
-  local answer state root port ip url version config_file
-  [[ -t 0 && -t 1 ]] || { error 'lampac setup предназначен для интерактивного терминала.'; return 2; }
-  trap 'printf "\nВыход по Ctrl+C. Уже начатую операцию отменить безопасно не всегда возможно.\n"; exit 130' INT
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    error "'lampac setup' is an interactive menu; in non-interactive shells use direct commands: lampac update|rollback|remove|start|stop|restart|status|log."
+    return 2
+  fi
+  trap 'printf "\nInterrupted.\n"; exit 130' INT
+  resolve_context || return 1
+
+  local state version answer
   while true; do
-    root="$(service_root)" || root=/opt/lampac
-    config_file="$root/init.conf"; [[ ! -e "$root/init.yaml" ]] || config_file="$root/init.yaml"
-    state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
-    case "$state" in active) state='работает' ;; inactive) state='остановлена' ;; failed) state='ошибка' ;; *) state='неизвестно' ;; esac
-    version='N/A'; [[ ! -r "$root/version.txt" ]] || { version="$(<"$root/version.txt")"; [[ -n "$version" ]] || version=N/A; }
-    port=9118
-    if [[ -e "$root/init.yaml" ]]; then port=''
-    elif command -v jq >/dev/null 2>&1 && [[ -r "$root/init.conf" ]]; then port="$(jq -r '.listen.port // 9118' "$root/init.conf" 2>/dev/null || printf 9118)"; [[ "$port" =~ ^[0-9]{1,5}$ ]] || port=9118; fi
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"; [[ -n "$ip" ]] || ip='<IP-сервера>'
-    if [[ -n "$port" ]]; then url="http://${ip}:${port}"; else url='см. init.yaml (порт не определён)'; fi
-    printf '\n  ██╗      █████╗ ███╗   ███╗██████╗  █████╗  ██████╗\n'
-    printf '  ██║     ██╔══██╗████╗ ████║██╔══██╗██╔══██╗██╔════╝\n'
-    printf '  ██║     ███████║██╔████╔██║██████╔╝███████║██║\n'
-    printf '  ██║     ██╔══██║██║╚██╔╝██║██╔═══╝ ██╔══██║██║\n'
-    printf '  ███████╗██║  ██║██║ ╚═╝ ██║██║     ██║  ██║╚██████╗\n'
-    printf '  ╚══════╝╚═╝  ╚═╝╚═╝     ╚═╝     ╚═╝  ╚═╝ ╚═════╝\n'
-    printf '                                          NextGen\n\n'
-    printf '  Installed Version: %s\n  Setup Manager:     %s\n\n' "$version" "$SETUP_VERSION"
-    printf '  ─── Lampac NextGen: меню управления службой ───\n\n'
-    printf '  Каталог: %s\n  Состояние: %s\n  Config    %s\n' "$root" "$state" "$config_file"
-    printf '  Service   systemctl status %s\n  Restart   systemctl restart %s\n  Logs      journalctl -u %s -f\n  URL       %s\n\n' "$SERVICE_NAME" "$SERVICE_NAME" "$SERVICE_NAME" "$url"
-    printf '    1) Перезапустить Lampac\n'
-    if [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" == active ]]; then printf '    2) Остановить Lampac\n'; else printf '    2) Запустить Lampac\n'; fi
-    printf '    3) Обновить до последней версии\n    4) Откатиться на более ранний релиз\n    5) Удалить Lampac NextGen\n    6) Показать последние 50 строк логов\n    7) Создать резервную копию пользовательских данных\n    0) Выйти\n\n  Выберите пункт: '
-    if ! IFS= read -r answer; then printf '\n'; return 0; fi
-    if (( ${#answer} > 16 )); then error 'Слишком длинный ввод.'; continue; fi
+    state="$(systemctl is-active "$STATE_UNIT" 2>/dev/null)"
+    state="${state:-unknown}"
+    version="$(read_installed_version 2>/dev/null)"
+    version="${version:-N/A}"
+    if [[ "$state" == active ]]; then
+      state='running'
+    elif [[ "$state" == inactive ]]; then
+      state='stopped'
+    fi
+
+    printf '\n  Lampac NextGen setup manager v%s (thin wrapper around the official installer)\n\n' "$WRAPPER_VERSION"
+    printf '  Service:      systemctl unit  %s\n' "$STATE_UNIT"
+    printf '  Install root: %s\n' "$STATE_ROOT"
+    printf '  Version:      %s\n' "$version"
+    printf '  State:        %s\n\n' "$state"
+    printf '    1) Restart the service\n'
+    if [[ "$(systemctl is-active "$STATE_UNIT" 2>/dev/null)" == active ]]; then
+      printf '    2) Stop the service\n'
+    else
+      printf '    2) Start the service\n'
+    fi
+    printf '    3) Update via the official installer\n'
+    printf '    4) Roll back to an earlier release via the official installer\n'
+    printf '    5) Remove via the official installer\n'
+    printf '    6) Show the last 50 log lines\n'
+    printf '    0) Exit\n\n  Choose an action: '
+
+    if ! IFS= read -r answer; then
+      printf '\n'
+      return 0
+    fi
+    (( ${#answer} <= 4 )) || { error 'Invalid input.'; continue; }
     case "$answer" in
-      1) service_action restart || error 'Не удалось перезапустить службу.' ;;
-      2) if [[ "$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)" == active ]]; then service_action stop || error 'Не удалось остановить службу.'; else service_action start || error 'Не удалось запустить службу.'; fi ;;
-      3) run_admin --update || true ;;
-      4) run_admin --rollback || true ;;
-      5) run_admin --remove || true; [[ ! -f "$root/Core.dll" ]] && return 0 ;;
-      6) show_recent_logs || error 'Не удалось прочитать журнал службы.' ;;
-      7) run_admin --backup || true ;;
-      0) return 0 ;;
-      '') error 'Пустой ввод: выберите пункт от 1 до 7 или 0.' ;;
-      *) error 'Неизвестный пункт: выберите пункт от 1 до 7 или 0.' ;;
+      1) run_privileged systemctl restart "$STATE_UNIT" && info 'Restart requested.' ;;
+      2)
+        if [[ "$(systemctl is-active "$STATE_UNIT" 2>/dev/null)" == active ]]; then
+          run_privileged systemctl stop "$STATE_UNIT" && info 'Stop requested.'
+        else
+          run_privileged systemctl start "$STATE_UNIT" && info 'Start requested.'
+        fi ;;
+      3) cmd_update ;;
+      4) cmd_rollback ;;
+      5) cmd_remove && return 0 ;;
+      6) cmd_logs ;;
+      0|q|Q) return 0 ;;
+      *) error "Unknown choice '$answer'." ;;
     esac
   done
 }
 
-install_setup_command() {
-  local source_path target="$COMMAND_PATH" temporary
-  [[ "$(uname -s)" == Linux ]] || { error 'Установщик поддерживает только Linux.'; return 1; }
-  command -v systemctl >/dev/null 2>&1 || { error 'systemd не найден.'; return 1; }
-  source_path="$(readlink -f -- "${BASH_SOURCE[0]}")" || { error 'Не удалось определить файл установщика.'; return 1; }
+# ─── Self-install of the wrapper command ──────────────────────────────────────
+
+cmd_install_self() {
+  local src
+  [[ "$(uname -s 2>/dev/null)" == 'Linux' ]] || { error 'The setup manager supports Linux only.'; return 1; }
+  command -v systemctl >/dev/null 2>&1 || { error 'systemd (systemctl) is required to manage Lampac.'; return 1; }
+
+  src="$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)" \
+    || { error 'Failed to resolve the wrapper file location.'; return 1; }
+
   if (( EUID != 0 )); then
-    command -v sudo >/dev/null 2>&1 || { error 'Для установки нужны права root или sudo.'; return 1; }
-    exec sudo bash "$source_path"
+    if [[ "${LAMPAC_SETUP_ELEVATION:-}" == 1 ]]; then
+      info 'Running without root privileges; the target directory must already be writable.'
+    else
+      command -v sudo >/dev/null 2>&1 \
+        || { error "Installing into $(dirname "$COMMAND_PATH") requires root or sudo."; return 1; }
+      export LAMPAC_SETUP_ELEVATION=1
+      exec sudo -E bash "$src" install
+    fi
   fi
-  service_root >/dev/null || { error 'Не найдена подтверждённая нативная установка Lampac NextGen с lampac.service.'; return 1; }
-  if { [[ -e "$target" ]] || [[ -L "$target" ]]; } \
-    && { [[ -L "$target" ]] || ! grep -Fq '# Lampac NextGen setup command (managed by installer)' "$target"; }; then
-    error "$target уже существует и не принадлежит установщику; файл не изменён."
-    return 1
+
+  if [[ "$src" == "$COMMAND_PATH" ]]; then
+    info "The wrapper command is already installed at $COMMAND_PATH."
+    return 0
   fi
-  install -d -o root -g root -m 755 /usr/local/bin || return 1
-  temporary="$(mktemp /usr/local/bin/.lampac.XXXXXX)" || return 1
-  if ! install -o root -g root -m 755 "$source_path" "$temporary" || ! mv -f -- "$temporary" "$target"; then
+
+  install -d -m 755 "$(dirname "$COMMAND_PATH")" \
+    || { error "Failed to create $(dirname "$COMMAND_PATH")."; return 1; }
+
+  if [[ -e "$COMMAND_PATH" || -L "$COMMAND_PATH" ]]; then
+    if [[ -L "$COMMAND_PATH" ]]; then
+      error "$COMMAND_PATH exists as a symlink; refusing to overwrite a foreign file."
+      return 1
+    fi
+    if grep -Fq "$WRAPPER_MARKER" "$COMMAND_PATH" || grep -Fq "$LEGACY_MARKER" "$COMMAND_PATH"; then
+      info "Existing wrapper copy found at $COMMAND_PATH; it will be replaced."
+    else
+      error "$COMMAND_PATH already exists and does not belong to the lampac setup manager; refusing to overwrite an unrelated command."
+      return 1
+    fi
+  fi
+
+  local temporary
+  temporary="$(mktemp "$(dirname "$COMMAND_PATH")/.lampac.XXXXXX")" \
+    || { error 'Failed to create a temporary file for installation.'; return 1; }
+  if ! install -m 755 "$src" "$temporary"; then
     rm -f -- "$temporary"
-    error 'Не удалось установить команду /usr/local/bin/lampac.'
+    error "Failed to install the wrapper command to $COMMAND_PATH."
     return 1
   fi
-  printf 'Готово. Запустите: lampac setup\n'
+  if ! mv -f -- "$temporary" "$COMMAND_PATH"; then
+    rm -f -- "$temporary"
+    error "Failed to finalize installation of $COMMAND_PATH."
+    return 1
+  fi
+
+  info "Installed: $COMMAND_PATH"
+  info "Run 'lampac setup' for the interactive menu; see 'lampac --help'."
+  info "Non-default service example: LAMPAC_SERVICE_NAME=lampac-nextgen lampac setup"
+  return 0
 }
 
-case "${1:-}" in
-  setup)
-    shift
-    if (( $# == 0 )); then setup_menu; exit $?; fi
-    if (( EUID != 0 )); then
-      command -v sudo >/dev/null 2>&1 || { error 'Для этого действия нужны права root или sudo.'; exit 1; }
-      exec sudo "$COMMAND_PATH" setup "$@"
-    fi
-    setup_action "$@"
-    exit $? ;;
-  '')
-    (( $# == 0 )) || { error 'Использование: bash install-lampac-setup.sh'; exit 2; }
-    if [[ "$(readlink -f -- "$0" 2>/dev/null)" == "$COMMAND_PATH" ]]; then error 'Использование: lampac setup'; exit 2; fi
-    install_setup_command
-    exit $? ;;
-  *) error 'Использование: bash install-lampac-setup.sh'; exit 2 ;;
-esac
+# ─── Dispatch ─────────────────────────────────────────────────────────────────
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    '')
+      if [[ "$(readlink -f -- "${BASH_SOURCE[0]}" 2>/dev/null)" == "$COMMAND_PATH" ]]; then
+        usage
+        return 0
+      fi
+      cmd_install_self ;;
+    install) shift; cmd_install_self "$@" ;;
+    setup)
+      shift
+      if (( $# )); then
+        error "'setup' takes no arguments; use direct commands: lampac update|rollback|remove|start|stop|restart|status|log."
+        return 2
+      fi
+      setup_menu ;;
+    update) shift; cmd_update "$@" ;;
+    rollback) shift; cmd_rollback "$@" ;;
+    remove) shift; cmd_remove "$@" ;;
+    start|stop|restart) cmd_service "$1" ;;
+    status) cmd_status ;;
+    log|logs) cmd_logs ;;
+    help|-h|--help) usage; return 0 ;;
+    version|--version) printf 'lampac-setup-manager %s\n' "$WRAPPER_VERSION"; return 0 ;;
+    *) error "Unknown command: $cmd"; usage >&2; return 2 ;;
+  esac
+}
+
+main "$@"
